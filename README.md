@@ -3,7 +3,7 @@
 **A multi-source primitive for GenLayer oracles.** One flaky source should cost you a vote,
 not the whole transaction.
 
-- **Contract on Testnet Bradbury:** [`0x9734Ff4419f3937c43580ccf3123AD554A7D2F50`](https://explorer-bradbury.genlayer.com/address/0x9734Ff4419f3937c43580ccf3123AD554A7D2F50)
+- **Contract on Testnet Bradbury:** [`0x59dD00eEaB89eaDbB1dF0836D64425C94DE9d7A3`](https://explorer-bradbury.genlayer.com/address/0x59dD00eEaB89eaDbB1dF0836D64425C94DE9d7A3)
 
 ---
 
@@ -55,7 +55,7 @@ Both halves ran on Bradbury on the same night, against the same problematic sour
 | | Sources | Outcome |
 | --- | --- | --- |
 | Single-source oracle | `docs.genlayer.com/developers/networks` | **UNDETERMINED** — nothing written |
-| Corroborate | the same page, plus two text endpoints | **SUPPORTS** — settled in 50s |
+| Corroborate | the same page, plus two text endpoints | **SUPPORTS** — settled in 51s |
 
 The claim, verbatim from `get_claim` on-chain:
 
@@ -71,7 +71,7 @@ The claim, verbatim from `get_claim` on-chain:
   "verdict":   "SUPPORTS",
   "agreement": 2,
   "decisive":  2,
-  "note": "Decisive line: \"Polymarket is an American cryptocurrency-based prediction market.\""
+  "note": "The source quotes Wikipedia: 'Polymarket is an American cryptocurrency-based prediction market'."
 }
 ```
 
@@ -127,6 +127,14 @@ authoritative it looks.
 
 ## Implementation notes
 
+- **Shaped so genvm-lint can prove it.** The non-deterministic functions are defined inline
+  inside the public method rather than returned from a factory. genvm-lint establishes
+  statically which code may run inside a consensus block by matching the qualified name of the
+  function passed to `gl.vm.run_nondet_unsafe` against the scope where the `gl.nondet.*` calls
+  were found; a closure defined in one scope and passed in another breaks that match, and the
+  linter correctly refuses to certify it. Every `gl.*` call is spelled out literally for the
+  same reason — the check matches the dotted name as text, so an aliased import is invisible to
+  it. Verified with `genvm-lint 0.11.0`: `lint passed (3 checks)`.
 - **Written against the SDK source, not the docs.** GenLayer's documentation contains errors
   that are load-bearing if copied: `gl.UserError` does not exist (it is `gl.vm.UserError`), and
   the web response field is `.status`, not `.status_code`. Every call here was checked against

@@ -12,23 +12,36 @@
 # nothing is written. The contract is fine. The consensus is fine. The source
 # broke the whole thing.
 #
-# This is not hypothetical. It happened twice on Testnet Bradbury to the project
-# this primitive was extracted from, and the failures are on-chain:
+# This is not hypothetical. It happened on Testnet Bradbury to the project this
+# primitive was extracted from, and the failure is on-chain:
 #   explorer-bradbury.genlayer.com/tx/0x14f9624d245fb5c776749265181b14e5221f3c1445dbabdf97c4f5c592fd011a
 #
 # THE FIX
 #
 # Judge several sources inside a single non-deterministic block and take the
 # majority. One flaky fetch no longer decides the answer, it only moves one vote.
-# A validator that receives a half-rendered page from source A still lands on the
-# same majority as everyone else if sources B and C read cleanly. Redundancy
-# reduces the variance of the final value, and it is variance in that value —
-# not disagreement about the truth — that causes deadlock.
+# A validator that receives a broken read from source A still lands on the same
+# majority as everyone else if sources B and C read cleanly. Redundancy reduces
+# the variance of the final value, and it is variance in that value — not
+# disagreement about the truth — that causes deadlock.
 #
 # Consensus is then checked on the majority alone. Per-source verdicts are
 # recorded for auditability but deliberately excluded from the agreement test,
 # because requiring those to match would reintroduce exactly the fragility this
 # is built to remove.
+#
+# A NOTE ON SHAPE
+#
+# The non-deterministic functions are defined inline inside the public method
+# rather than produced by a factory. That is not a style preference: genvm-lint
+# proves statically which code can run inside a consensus block, by matching the
+# qualified name of the function passed to gl.vm.run_nondet_unsafe against the
+# scope where the gl.nondet.* calls were found. A closure returned from a factory
+# is defined in one scope and passed in another, the two names never match, and
+# the linter correctly reports that it cannot prove those calls are reachable
+# from a consensus block. Every gl.* call is also spelled out literally, since
+# the check matches the dotted name as text and an aliased import is invisible
+# to it.
 
 from dataclasses import dataclass
 
@@ -72,6 +85,12 @@ class Claim:
 
 
 def _prompt(statement: str, criteria: str, page: str) -> str:
+    """Compose the per-source classification prompt.
+
+    A module-level helper called from inside the non-deterministic block, which
+    the linter traces through the call graph without difficulty — it is closures
+    crossing a function boundary that break the trace, not ordinary calls.
+    """
     return f"""You are checking a single source against a statement. Use ONLY the source text below.
 
 STATEMENT:
@@ -107,13 +126,10 @@ def _tally(verdicts: list) -> tuple:
     happened to be counted first.
     """
     counts = {}
-    for v in verdicts:
-        if v in _DECISIVE:
-            counts[v] = counts.get(v, 0) + 1
-
     decisive = 0
     for v in verdicts:
         if v in _DECISIVE:
+            counts[v] = counts.get(v, 0) + 1
             decisive += 1
 
     if not counts:
@@ -124,92 +140,6 @@ def _tally(verdicts: list) -> tuple:
     if len(winners) != 1:
         return (UNCLEAR, 0, decisive)      # a genuine split is not a majority
     return (winners[0], top, decisive)
-
-
-def _make_reader(statement: str, criteria: str, urls: list):
-    """Return the non-deterministic closure.
-
-    Takes only plain Python values. Storage objects are slot-bound views that
-    cannot be serialised into the sub-VM a nondet block runs in; capturing one
-    here would fail the block, and the symptom would look like a consensus
-    problem rather than the storage bug it is.
-    """
-
-    def read() -> dict:
-        verdicts = []
-        notes = []
-
-        for url in urls:
-            # A plain HTTP GET, deliberately not web.render. render() drives a
-            # real headless browser per call and takes seconds; three of those
-            # plus three inference calls exceeds the node's wall-clock budget and
-            # the whole transaction dies as VALIDATORS_TIMEOUT. There is no
-            # per-request timeout to pass, so choosing the cheap fetch is the
-            # only lever available. Sources should therefore be endpoints that
-            # return text or JSON rather than markup.
-            #
-            # One dead source must degrade to a single lost vote, not take the
-            # whole block down with it. This is the resilience being built.
-            try:
-                res = gl.nondet.web.get(url)
-                if res.status >= 400 or res.body is None:
-                    verdicts.append(UNAVAILABLE)
-                    notes.append("")
-                    continue
-                page = res.body.decode("utf-8", errors="replace")[:_MAX_PAGE_CHARS]
-            except Exception:
-                verdicts.append(UNAVAILABLE)
-                notes.append("")
-                continue
-
-            try:
-                raw = gl.nondet.exec_prompt(
-                    _prompt(statement, criteria, page), response_format="json"
-                )
-                v = str(raw.get("verdict", "")).strip().upper()
-                if v not in _VERDICTS:
-                    v = UNCLEAR
-                verdicts.append(v)
-                notes.append(str(raw.get("note", ""))[:_MAX_NOTE])
-            except Exception:
-                verdicts.append(UNCLEAR)
-                notes.append("")
-
-        majority, agreement, decisive = _tally(verdicts)
-
-        note = ""
-        for i in range(len(verdicts)):
-            if verdicts[i] == majority and notes[i]:
-                note = notes[i]
-                break
-
-        return {
-            "verdict": majority,
-            "verdicts": verdicts,
-            "agreement": agreement,
-            "decisive": decisive,
-            "note": note,
-        }
-
-    return read
-
-
-def _make_validator(read):
-    """Agreement is tested on the majority alone.
-
-    Comparing the per-source list would defeat the entire point: one source
-    flipping on one node would deadlock the transaction, which is the failure
-    this primitive removes. The majority is a three-value enum, so equality is
-    exact, deterministic, cheaper than a judge model, and cannot be argued into
-    'close enough'.
-    """
-
-    def validate(leader_result) -> bool:
-        if not isinstance(leader_result, gl.vm.Return):
-            return False
-        return leader_result.calldata["verdict"] == read()["verdict"]
-
-    return validate
 
 
 class Corroborate(gl.Contract):
@@ -271,13 +201,85 @@ class Corroborate(gl.Contract):
         if claim.resolved:
             raise gl.vm.UserError("claim already corroborated")
 
-        # Hoist to plain Python before building the closure.
+        # Hoist to plain Python before defining the closures. Storage objects are
+        # slot-bound views that cannot be serialised into the sub-VM a
+        # non-deterministic block runs in; capturing one here would fail the
+        # block, and the symptom would look like a consensus problem rather than
+        # the storage bug it is.
         statement = str(claim.statement)
         criteria = str(claim.criteria)
         urls = list(claim.sources)
 
-        read = _make_reader(statement, criteria, urls)
-        result = gl.vm.run_nondet_unsafe(read, _make_validator(read))
+        def read() -> dict:
+            verdicts = []
+            notes = []
+
+            for url in urls:
+                # A plain HTTP GET, deliberately not gl.nondet.web.render.
+                # render() drives a real headless browser per call and takes
+                # seconds; several of those plus several inference calls exceeds
+                # the node's wall-clock budget and the transaction dies as
+                # VALIDATORS_TIMEOUT. There is no per-request timeout to pass, so
+                # choosing the cheap fetch is the only lever available. Sources
+                # should therefore be endpoints returning text or JSON, not markup.
+                #
+                # One dead source must degrade to a single lost vote, not take the
+                # whole block down with it. This is the resilience being built.
+                try:
+                    res = gl.nondet.web.get(url)
+                    if res.status >= 400 or res.body is None:
+                        verdicts.append(UNAVAILABLE)
+                        notes.append("")
+                        continue
+                    page = res.body.decode("utf-8", errors="replace")[:_MAX_PAGE_CHARS]
+                except Exception:
+                    verdicts.append(UNAVAILABLE)
+                    notes.append("")
+                    continue
+
+                try:
+                    raw = gl.nondet.exec_prompt(
+                        _prompt(statement, criteria, page), response_format="json"
+                    )
+                    v = str(raw.get("verdict", "")).strip().upper()
+                    if v not in _VERDICTS:
+                        v = UNCLEAR
+                    verdicts.append(v)
+                    notes.append(str(raw.get("note", ""))[:_MAX_NOTE])
+                except Exception:
+                    verdicts.append(UNCLEAR)
+                    notes.append("")
+
+            majority, agreement, decisive = _tally(verdicts)
+
+            note = ""
+            for i in range(len(verdicts)):
+                if verdicts[i] == majority and notes[i]:
+                    note = notes[i]
+                    break
+
+            return {
+                "verdict": majority,
+                "verdicts": verdicts,
+                "agreement": agreement,
+                "decisive": decisive,
+                "note": note,
+            }
+
+        def validate(leader_result) -> bool:
+            """Agreement is tested on the majority alone.
+
+            Comparing the per-source list would defeat the entire point: one
+            source flipping on one node would deadlock the transaction, which is
+            the failure this primitive removes. The majority is a three-value
+            enum, so equality is exact, deterministic, cheaper than a judge
+            model, and cannot be argued into 'close enough'.
+            """
+            if not isinstance(leader_result, gl.vm.Return):
+                return False
+            return leader_result.calldata["verdict"] == read()["verdict"]
+
+        result = gl.vm.run_nondet_unsafe(read, validate)
 
         claim.verdict = result["verdict"]
         claim.verdicts = result["verdicts"]
